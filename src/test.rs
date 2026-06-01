@@ -1,4 +1,4 @@
-use soroban_sdk::{Env, Symbol, symbol_short, IntoVal};
+use soroban_sdk::{Bytes, Env, Symbol, symbol_short, IntoVal};
 use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
 use crate::{
     ContractError, TimeLockedUpgradeContract, TimeLockedUpgradeContractClient,
@@ -18,6 +18,12 @@ fn advance_ledger_timestamp(env: &Env, delta: u64) {
         min_persistent_entry_ttl: 0,
         max_entry_ttl: u32::MAX,
     });
+}
+
+fn nonce_proof(env: &Env, nonce: u64, salt_seed: &[u8]) -> (Bytes, soroban_sdk::BytesN<32>) {
+    let salt = Bytes::from_slice(env, salt_seed);
+    let signature = crate::nonce::derive_salt_signature(env, nonce, salt.clone());
+    (salt, signature)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -42,6 +48,7 @@ fn test_initialize_and_basic_functionality() {
     client.set_value(&42, &admin, &0, &u64::MAX);
     let data = client.get_data();
     assert_eq!(data.value, 42);
+    assert_eq!(client.get_coordinator_nonce(&admin), 1);
 }
 
 #[test]
@@ -64,10 +71,28 @@ fn test_propose_upgrade() {
     let pending_upgrade = pending.unwrap();
     assert_eq!(pending_upgrade.new_wasm_hash, new_wasm_hash);
     assert_eq!(pending_upgrade.proposer, admin);
+    assert_eq!(client.get_coordinator_nonce(&admin), 1);
 
     let remaining = client.get_upgrade_timelock_remaining();
     assert!(remaining.is_some());
     assert_eq!(remaining.unwrap(), UPGRADE_DELAY_SECONDS);
+}
+
+#[test]
+#[should_panic(expected = "Invalid salt signature")]
+fn test_set_value_rejects_bad_salt_signature() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
+    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
+
+    let admin = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin);
+
+    let salt = Bytes::from_slice(&env, b"bad-salt");
+    let bad_signature = soroban_sdk::BytesN::from_array(&env, &[9u8; 32]);
+
+    client.set_value(&42, &admin, &0, &salt, &bad_signature);
 }
 
 #[test]

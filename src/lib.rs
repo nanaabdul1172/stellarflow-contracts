@@ -1,7 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, BytesN, Map, Symbol, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol, Vec};
 
-mod nonce;
+pub(crate) mod nonce;
 use crate::nonce::{consume_nonce, get_nonce};
 
 #[contracterror]
@@ -250,7 +250,7 @@ impl TimeLockedUpgradeContract {
         }
         
         proposer.require_auth();
-        consume_nonce(&env, &proposer, nonce);
+        consume_nonce(&env, &proposer, nonce, salt, salt_signature);
         let current_time = env.ledger().timestamp();
         
         let pending_upgrade = PendingUpgrade {
@@ -276,7 +276,7 @@ impl TimeLockedUpgradeContract {
         }
         
         executor.require_auth();
-        consume_nonce(&env, &executor, nonce);
+        consume_nonce(&env, &executor, nonce, salt, salt_signature);
         let pending_upgrade: PendingUpgrade = env
             .storage()
             .instance()
@@ -356,7 +356,7 @@ impl TimeLockedUpgradeContract {
         }
         
         setter.require_auth();
-        consume_nonce(&env, &setter, nonce);
+        consume_nonce(&env, &setter, nonce, salt, salt_signature);
         data.value = value;
         env.storage().instance().set(&DATA_KEY, &data);
 
