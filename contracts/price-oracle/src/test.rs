@@ -6,7 +6,6 @@ use soroban_sdk::{
     testutils::Ledger, vec, Address, Env, Symbol,
 };
 
-#[soroban_sdk::contractevent]
 pub struct TokenTransferEvent {
     pub from: Address,
     pub to: Address,
@@ -20,8 +19,7 @@ pub struct DummyToken;
 impl DummyToken {
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
-        env.events()
-            .publish_event(&TokenTransferEvent { from, to, amount });
+        env.events().publish((Symbol::new(&env, "token_transfer_event"),), (from, to, amount));
     }
 }
 
@@ -894,6 +892,7 @@ fn test_clear_assets_removes_persistent_price_keys() {
             &PriceData {
                 price: 1_000,
                 timestamp: 10,
+                ledger_sequence: 0,
                 provider: env.current_contract_address(),
                 decimals: 2,
                 confidence_score: 100,
@@ -905,6 +904,7 @@ fn test_clear_assets_removes_persistent_price_keys() {
             &PriceData {
                 price: 2_000,
                 timestamp: 10,
+                ledger_sequence: 0,
                 provider: env.current_contract_address(),
                 decimals: 2,
                 confidence_score: 100,
@@ -935,6 +935,7 @@ fn test_clear_assets_rejects_batches_above_limit_atomically() {
             &PriceData {
                 price: 1_000,
                 timestamp: 10,
+                ledger_sequence: 0,
                 provider: env.current_contract_address(),
                 decimals: 2,
                 confidence_score: 100,
@@ -2664,6 +2665,107 @@ fn test_get_bypass_expiry_returns_stored_value() {
 }
 
 #[test]
+fn test_buffer_truncation_with_equal_weights() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("GHS");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create 13 providers all with the same weight
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for _ in 0..13 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            crate::auth::_set_provider_weight(&env, &provider, 75u32);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &800_000_i128, &6u32, &3600u64);
+
+    // Have all 13 providers submit prices
+    env.ledger().set_sequence_number(300);
+    for i in 0..13 {
+        let provider = providers.get(i).unwrap();
+        let price = 800_000_i128 + (i as i128 * 10);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Get the buffer and verify it was truncated to 11
+    let buffer = client.get_price_buffer_data(&asset);
+    assert!(buffer.is_some(), "Buffer should exist");
+    
+    let buffer_data = buffer.unwrap();
+    assert_eq!(
+        buffer_data.entries.len(),
+        11,
+        "Buffer should be truncated to MAX_MEDIAN_ENTRIES (11) even with equal weights"
+    );
+}
+
+#[test]
+fn test_median_calculation_after_truncation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(PriceOracle, ());
+    let client = PriceOracleClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    // Initialize contract
+    client.init_admin(&admin);
+    client.add_asset(&admin, &asset);
+
+    // Create 12 providers with varying weights
+    let mut providers = soroban_sdk::Vec::new(&env);
+    for i in 0..12 {
+        let provider = Address::generate(&env);
+        providers.push_back(provider.clone());
+        
+        env.as_contract(&contract_id, || {
+            crate::auth::_add_provider(&env, &provider);
+            let weight = if i < 11 { 100u32 } else { 10u32 }; // Last provider has low weight
+            crate::auth::_set_provider_weight(&env, &provider, weight);
+        });
+    }
+
+    // Set initial price
+    client.set_price(&asset, &1_000_000_i128, &6u32, &3600u64);
+
+    // Have all 12 providers submit prices
+    env.ledger().set_sequence_number(400);
+    for i in 0..12 {
+        let provider = providers.get(i).unwrap();
+        let price = 1_000_000_i128 + (i as i128 * 1000);
+        client.update_price(&provider, &asset, &price, &6u32, 90u32, &3600u64);
+    }
+
+    // Verify the price was updated (median calculation succeeded)
+    let price_data = client.get_price(&asset, &true);
+    assert!(
+        price_data.price >= 1_000_000_i128,
+        "Median price should be calculated from truncated buffer"
+    );
+    
+    // The low-weight provider (index 11) should have been excluded
+    let buffer = client.get_price_buffer_data(&asset).unwrap();
+    assert_eq!(buffer.entries.len(), 11, "Buffer should contain 11 entries");
+}
+
+#[test]
 fn test_disable_bypass_clears_expiry() {
     let (env, contract_id, client) = setup();
     let admin = Address::generate(&env);
@@ -2857,4 +2959,81 @@ fn test_get_price_at_exact_boundary_does_not_panic() {
     env.ledger().set_timestamp(5_300);
     let result = client.try_get_price(&asset, &true);
     assert!(result.is_ok(), "expected Ok at exact boundary");
+}
+
+#[test]
+fn test_relayer_activity_tracking() {
+    let (env, contract_id, client) = setup();
+    let admin = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    client.initialize(&admin, &soroban_sdk::vec![&env, asset.clone()]);
+    add_provider(&env, &contract_id, &provider);
+
+    // Initial state
+    assert_eq!(client.get_provider_last_seen_ledger(&provider), 0);
+    assert!(!client.is_provider_active(&provider, &10));
+
+    // Update price at ledger 100
+    env.ledger().set_sequence(100);
+    client.update_price(&provider, &asset, &1000_i128, &6u32, &100u32, &3600u64);
+
+    // Check last seen ledger
+    assert_eq!(client.get_provider_last_seen_ledger(&provider), 100);
+
+    // Check activity within window of 10 ledgers
+    assert!(client.is_provider_active(&provider, &10)); // 100 <= 100 + 10
+
+    // Advance ledger to 110 (exactly at the end of the window)
+    env.ledger().set_sequence(110);
+    assert!(client.is_provider_active(&provider, &10)); // 110 <= 100 + 10
+
+    // Advance ledger to 111 (just outside the window)
+    env.ledger().set_sequence(111);
+    assert!(!client.is_provider_active(&provider, &10)); // 111 > 110
+}
+
+#[test]
+fn test_graceful_recovery_clears_metrics() {
+    let (env, contract_id, client) = setup();
+    let admin1 = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let asset = symbol_short!("NGN");
+
+    // Initialize with 2 admins for multi-sig halt
+    let pairs = soroban_sdk::vec![&env, asset.clone()];
+    client.initialize(&admin1, &pairs);
+    env.as_contract(&contract_id, || {
+        crate::auth::_add_authorized(&env, &admin2);
+        crate::auth::_add_provider(&env, &provider);
+    });
+
+    // 1. Populate metrics: Price update (adds to TWAP, RecentEvents, LastSeen)
+    client.update_price(&provider, &asset, &1000_i128, &6u32, &100u32, &3600u64);
+    
+    // Add relayer infraction
+    env.as_contract(&contract_id, || {
+        crate::slashing::report_missed_blocks(&env, &provider, 5).unwrap();
+    });
+    
+    assert_eq!(client.get_twap(&asset), Some(1000));
+    assert_eq!(client.get_last_n_events(&5).len(), 1);
+    assert_eq!(client.get_provider_consecutive_missed_blocks(&provider), 5);
+
+    // 2. Emergency Halt
+    client.set_emergency_halt(&admin1, &admin2, &true);
+    assert!(client.is_halted());
+
+    // 3. Resume (Triggers Graceful Recovery)
+    env.ledger().set_sequence(500);
+    client.set_emergency_halt(&admin1, &admin2, &false);
+    assert!(!client.is_halted());
+
+    // 4. Verify Metrics Cleared
+    assert_eq!(client.get_twap(&asset), None);
+    assert_eq!(client.get_last_n_events(&5).len(), 0);
+    assert_eq!(client.get_provider_consecutive_missed_blocks(&provider), 0);
+    assert_eq!(client.get_provider_last_seen_ledger(&provider), 500);
 }
