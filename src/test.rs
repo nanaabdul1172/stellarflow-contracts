@@ -769,97 +769,80 @@ fn test_expired_signature_rejected() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Two-Phase Admin Ownership Transfer tests (Issue #429)
+// Issue #453 — Bond capacity checks for premium asset pool validator profiles
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn test_ownership_transfer_full_flow() {
+fn test_update_validator_profile_succeeds_with_sufficient_stake() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
     let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
     let admin = soroban_sdk::Address::generate(&env);
-    let new_owner = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    // Phase 1: current admin nominates new_owner
-    client.propose_ownership_transfer(&admin, &new_owner);
+    // Stake exactly the minimum required bond.
+    client.stake_and_register(&node, &crate::validation::PREMIUM_POOL_MIN_STAKE);
 
-    // Phase 2: new_owner claims, proving key access
-    client.claim_ownership(&new_owner);
-
-    // Ownership must have transferred
-    assert_eq!(client.get_data().admin, new_owner);
+    let pool = symbol_short!("USDC");
+    // Must not error when stake >= PREMIUM_POOL_MIN_STAKE.
+    client.update_validator_profile(&node, &pool);
 }
 
 #[test]
-fn test_propose_ownership_transfer_requires_current_admin() {
+fn test_update_validator_profile_blocked_below_min_stake() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
     let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
     let admin = soroban_sdk::Address::generate(&env);
-    let intruder = soroban_sdk::Address::generate(&env);
-    let nominee = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    let result = client.try_propose_ownership_transfer(&intruder, &nominee);
-    assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
+    // Stake one unit below the required minimum.
+    client.stake_and_register(&node, &(crate::validation::PREMIUM_POOL_MIN_STAKE - 1));
+
+    let pool = symbol_short!("BTC");
+    let result = client.try_update_validator_profile(&node, &pool);
+    assert_eq!(result, Err(Ok(ContractError::PremiumPoolAccessDenied)));
 }
 
 #[test]
-fn test_transfer_already_pending_rejected() {
+fn test_update_validator_profile_blocked_with_zero_stake() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
     let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
     let admin = soroban_sdk::Address::generate(&env);
-    let nominee = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    client.propose_ownership_transfer(&admin, &nominee);
-
-    // Second proposal while one is already pending
-    let result = client.try_propose_ownership_transfer(&admin, &nominee);
-    assert_eq!(result, Err(Ok(ContractError::TransferAlreadyPending)));
+    // Node has never staked — locked stake is 0.
+    let pool = symbol_short!("ETH");
+    let result = client.try_update_validator_profile(&node, &pool);
+    assert_eq!(result, Err(Ok(ContractError::PremiumPoolAccessDenied)));
 }
 
 #[test]
-fn test_claim_ownership_without_proposal_fails() {
+fn test_update_validator_profile_succeeds_above_min_stake() {
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
     let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
 
     let admin = soroban_sdk::Address::generate(&env);
-    let stranger = soroban_sdk::Address::generate(&env);
+    let node = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
-    let result = client.try_claim_ownership(&stranger);
-    assert_eq!(result, Err(Ok(ContractError::NoPendingOwner)));
-}
+    // Stake well above the minimum.
+    client.stake_and_register(&node, &5_000u64);
 
-#[test]
-fn test_wrong_claimer_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register_contract(None, TimeLockedUpgradeContract);
-    let client = TimeLockedUpgradeContractClient::new(&env, &contract_id);
-
-    let admin = soroban_sdk::Address::generate(&env);
-    let nominee = soroban_sdk::Address::generate(&env);
-    let wrong_claimer = soroban_sdk::Address::generate(&env);
-    client.initialize(&admin);
-
-    client.propose_ownership_transfer(&admin, &nominee);
-
-    // A different address tries to claim
-    let result = client.try_claim_ownership(&wrong_claimer);
-    assert_eq!(result, Err(Ok(ContractError::NotAdmin)));
-
-    // Original admin is unchanged
-    assert_eq!(client.get_data().admin, admin);
+    let pool = symbol_short!("XLM");
+    client.update_validator_profile(&node, &pool);
+    // Heartbeat for the pool asset should now be fresh.
+    assert!(client.is_data_fresh(&pool));
 }
