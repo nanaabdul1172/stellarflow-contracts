@@ -48,6 +48,7 @@ pub fn asset_id_to_symbol(env: &Env, id: AssetId) -> Symbol {
 pub(crate) mod nonce;
 use crate::nonce::{consume_nonce, get_nonce};
 
+pub mod auth;
 pub mod consensus;
 pub mod staking_tiers;
 pub mod governance;
@@ -97,7 +98,7 @@ pub enum ContractError {
 }
 
 // Contract state keys
-const DATA_KEY: Symbol = symbol_short!("DATA");
+pub(crate) const DATA_KEY: Symbol = symbol_short!("DATA");
 const PENDING_UPGRADE_KEY: Symbol = symbol_short!("PENDING");
 const UPGRADE_DELAY_SECONDS: u64 = 48 * 60 * 60; 
 const STAKE_REGISTRY_KEY: Symbol = symbol_short!("STAKES");
@@ -425,12 +426,14 @@ impl TimeLockedUpgradeContract {
         env: Env,
         admin: Address,
         config: StakingTierConfig,
+        signers: Vec<Address>,
     ) -> Result<(), ContractError> {
         let data = Self::get_data(&env)?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
         admin.require_auth();
+        crate::auth::require_multisig(&env, &signers)?;
         validate_tier_config(&config)?;
         env.storage()
             .instance()
@@ -456,12 +459,14 @@ impl TimeLockedUpgradeContract {
         asset: AssetId,
         volume_score_floor: u32,
         volatility_bps: u32,
+        signers: Vec<Address>,
     ) -> Result<AssetFeedMetrics, ContractError> {
         let data = Self::get_data(&env)?;
         if data.admin != admin {
             return Err(ContractError::NotAdmin);
         }
         admin.require_auth();
+        crate::auth::require_multisig(&env, &signers)?;
 
         let metrics = AssetFeedMetrics {
             volume_score: volume_score_floor.min(100),

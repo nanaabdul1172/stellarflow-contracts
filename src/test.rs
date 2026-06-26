@@ -572,8 +572,9 @@ fn test_regional_feed_allows_lower_stake_than_premier_feed() {
     let regional: AssetId = 2654435761; // KES
     let premier: AssetId = 3897123275; // NGN
 
-    client.set_asset_feed_metrics(&admin, &regional, &10, &100);
-    client.set_asset_feed_metrics(&admin, &premier, &80, &1_000);
+    let signers = soroban_sdk::vec![&env, admin.clone(), admin.clone()];
+    client.set_asset_feed_metrics(&admin, &regional, &10, &100, &signers);
+    client.set_asset_feed_metrics(&admin, &premier, &80, &1_000, &signers);
 
     assert_eq!(client.get_staking_tier(&regional), StakingTier::Regional);
     assert_eq!(client.get_staking_tier(&premier), StakingTier::Premier);
@@ -626,6 +627,7 @@ fn test_custom_tier_config_is_enforced() {
     let node = soroban_sdk::Address::generate(&env);
     client.initialize(&admin);
 
+    let signers = soroban_sdk::vec![&env, admin.clone(), admin.clone()];
     client.set_staking_tier_config(
         &admin,
         &StakingTierConfig {
@@ -633,6 +635,7 @@ fn test_custom_tier_config_is_enforced() {
             standard_min_stake: 2_500,
             premier_min_stake: 25_000,
         },
+        &signers,
     );
 
     let asset: AssetId = 3219226362; // ZAR
